@@ -1,0 +1,25 @@
+[toolchain]
+anchor_version = "1.0.1"
+package_manager = "pnpm"
+
+[features]
+resolution = true
+skip-lint = false
+
+[features.mainnet]
+beton = ["mainnet"]
+bsh = ["mainnet"]
+
+[programs.mainnet]
+beton = "BpwBgBZ8WFDk7BswjJNoepmisZS1KfuoKbybCLaF5Hj6"
+bsh = "91ahrFntCbnRAcJhsSQGd4j2QNdiUZTbESA6cJYKeovn"
+
+[registry]
+url = "https://api.apr.dev"
+
+[provider]
+cluster = "mainnet"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+test = "vitest"

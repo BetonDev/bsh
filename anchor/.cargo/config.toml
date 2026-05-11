@@ -1,0 +1,14 @@
+# Force every cargo invocation rooted under `anchor/` to share the workspace
+# target directory at `anchor/target`. Without this, running `cargo build`
+# (or `cargo build-sbf`) from inside `anchor/programs/<name>/` can create a
+# *nested* `programs/<name>/target/deploy/<name>-keypair.json` that shadows
+# the canonical workspace keypair, producing the
+#
+#   Error: Program ID mismatch detected for program '<name>':
+#     Keypair file has: <stray>
+#     Source code has:  <declare_id!>
+#
+# error from `anchor build`. Pinning `target-dir` here makes the nested dir
+# physically impossible regardless of where the build is invoked.
+[build]
+target-dir = "target"

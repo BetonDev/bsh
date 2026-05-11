@@ -1,0 +1,16 @@
+[package]
+name = "beton-shared-types"
+version = "0.1.0"
+description = "Shared on-chain types and PDA seeds for the beton + bsh programs"
+edition = "2021"
+
+[lib]
+crate-type = ["lib"]
+
+[features]
+default = []
+idl-build = ["anchor-lang/idl-build"]
+mainnet = []
+
+[dependencies]
+anchor-lang = { version = "1.0.1" }
