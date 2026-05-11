@@ -75,7 +75,7 @@ compile_error!(
 #[cfg(not(feature = "no-entrypoint"))]
 solana_security_txt::security_txt! {
     name: "BSH",
-    project_url: "https://betonbtc.online",
+    project_url: "https://github.com/BetonDev/bsh",
     contacts: "email:betondev@proton.me,link:https://github.com/BetonDev/bsh/security/policy",
     policy: "https://github.com/BetonDev/bsh/security/policy",
     preferred_languages: "en",
