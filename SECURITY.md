@@ -8,7 +8,7 @@ This policy covers the public BSH source published at https://github.com/BetonDe
 
 Report vulnerabilities privately to betondev@proton.me.
 
-Include the affected program, network, program ID, reproduction steps, expected impact, and any proof of concept needed to validate the issue.
+Include the affected network, program ID, reproduction steps, expected impact, and any proof of concept needed to validate the issue.
 
 Do not publicly disclose the issue before a fix is available.
 Do not access, move, or place user funds at risk.

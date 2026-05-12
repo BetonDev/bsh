@@ -23,23 +23,19 @@
 //   * M9 — `GlobalState` now carries the version/reserved fields required by
 //     the audit hardening, but legacy state remains readable under test-mode
 //     until the historical layout can be retired entirely.
-//   * M10 — Test gaps documented for the next coverage pass:
-//     (a) > 10 000 BSH cross-tier purchase exercising tier transitions in a
-//         single call, (b) exact rent-exempt boundary on the SOL vault PDA,
-//         (c) `BuyLockedBsh` with a wrong `fee_treasury_1` account.
-//     Existing mollusk suite covers slippage, zero-payout, vault/state and
-//     ATA validation paths; missing cases above are non-security-critical.
-//   * L7 — Future paused-mode design (sketch only, no on-chain change yet):
-//     Add `paused: bool` to `GlobalState` (alongside the M9 `version: u8`
-//     migration so both layout changes ship together). Gate every mutating
-//     entrypoint on `require!(!ctx.accounts.state.paused, ErrorCode::Paused)`.
-//     Toggle via a new `set_paused(paused: bool)` instruction whose
-//     `Accounts` struct constrains `authority = upgrade_authority` (read
-//     from the program data account) so only the program's upgrade
-//     authority can flip the switch \u2014 no separate admin key, no
-//     governance surface, and revocable by relinquishing upgrade authority.
-//     Pausing must NOT block `auto_close_sale_vault`; the rent-reclaim
-//     path stays permissionless so the protocol can never be locked out.
+//   * M10 — Historical coverage note retired. The prior follow-ups no longer
+//     describe live risk: `BuyLockedBsh` caps each purchase at 5_000 BSH, so
+//     a >10_000-BSH single-call cross-tier case is unreachable; the
+//     `fee_treasury_1` sink is pinned by address constraints; and the current
+//     suite now covers prefunding, stale quotes, sold-out close-out, swap
+//     balance updates, and bounty authority validation. An exact rent-reserve
+//     boundary regression remains nice-to-have only, not a deployment blocker.
+//   * L7 — Current policy intentionally does not add a paused mode.
+//     `GlobalState` keeps reserve bytes for layout compatibility only, and
+//     any future authority-bearing change must be justified on its own.
+//     Sale bootstrap remains permissioned where explicitly modeled; swap,
+//     claim, and auto-close paths stay permissionless so routine users are
+//     not blocked by an admin-only circuit breaker.
 
 use anchor_lang::{prelude::*, system_program};
 use anchor_spl::{
@@ -84,6 +80,7 @@ solana_security_txt::security_txt! {
     acknowledgements: "None published."
 }
 
+#[cfg(any(not(feature = "test-mode"), test))]
 const BSH_MINT: Pubkey = pubkey!("3UyKBPAd6i9Ym1cf7aJsu2JEpGKT7QPUVtnmjykqUb6s");
 const INVENTORY_WALLET: Pubkey = pubkey!("BN6M5dhF45eitvZYnux2NK24ZMZq258BqvHKbLVbAxNm");
 const BETON_TREASURY_1: Pubkey = pubkey!("8REY953gpSbJNQmWd9bBbYGNw6x9VWudZ16r13MNmFax");
@@ -1329,11 +1326,10 @@ pub struct SwapBshForSol<'info> {
 pub struct GlobalState {
     /// Audit H-7 (production hardening): schema version byte. Initialised
     /// to [`GLOBAL_STATE_VERSION`] on `initialize` and re-asserted on
-    /// every read so a future post-revocation deserialiser can trust the
-    /// layout. The BSH program upgrade authority is revoked after
-    /// initialise (see SECURITY.md), making this version byte the only
-    /// post-deploy migration anchor; reserve room is included for a
-    /// `paused` flag or future feature flags without breaking layout.
+    /// every read so future deserialisers can trust the layout. While BSH
+    /// still retains upgrade authority for audited lifecycle changes, this
+    /// version byte remains the migration anchor; reserve room is included
+    /// for future compatible fields without breaking layout.
     pub version: u8,
     pub mint: Pubkey,
     pub sol_vault: Pubkey,
@@ -1346,8 +1342,9 @@ pub struct GlobalState {
     /// most one swap per slot — caps atomic-bundle MEV sandwich attacks
     /// and DoS-burst inventory drains without requiring per-wallet PDAs.
     pub last_swap_slot: u64,
-    /// Reserved future-flag bytes (paused, tier_index, etc.). Frozen-layout
-    /// once the upgrade authority is revoked.
+    /// Reserved compatibility bytes for future non-governance layout needs.
+    /// If upgrade authority is intentionally revoked in the final swap-only
+    /// state, whatever layout is live at that point becomes frozen.
     pub _reserved: [u8; 23],
 }
 
@@ -2071,8 +2068,8 @@ mod tests {
 
         harness.process(
             &instruction,
-            &[Check::instruction_err(
-                InstructionError::Custom(
+            &[Check::err(
+                solana_sdk::program_error::ProgramError::Custom(
                     anchor_lang::error::ERROR_CODE_OFFSET
                         + BshError::MissingSwapFundingTransfer as u32,
                 ),
