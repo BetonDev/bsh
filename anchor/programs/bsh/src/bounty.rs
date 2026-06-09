@@ -11,10 +11,10 @@
 //!     from the canonical inventory wallet `INVENTORY_WALLET`.
 //!   * Three independent milestones, each with a per-wallet payout and a
 //!     hard cap on the number of wallets that may claim:
-//!       - bets_created  ≥ 5  → 10 BSH × 100 wallets = 1_000 BSH
-//!       - bets_accepted ≥ 5  → 10 BSH × 100 wallets = 1_000 BSH
-//!       - wins_total    ≥ 5  → 30 BSH × 100 wallets = 3_000 BSH
-//!   * Total locked = 1_000 + 1_000 + 3_000 = 5_000 BSH.
+//!       - bets_matched ≥ 3 → 5 BSH × 100 wallets = 500 BSH
+//!       - wins_total   ≥ 3 → 15 BSH × 100 wallets = 1_500 BSH
+//!       - win_streak   ≥ 3 → 30 BSH × 100 wallets = 3_000 BSH
+//!   * Total locked = 500 + 1_500 + 3_000 = 5_000 BSH.
 //!
 //! Eligibility data lives in beton's `Activity` PDA. We re-derive that PDA
 //! cross-program (`seeds::program = BETON_PROGRAM_ID`) so BSH never has
@@ -28,7 +28,7 @@ use anchor_spl::{
 
 use beton_shared_types::{Activity, ACTIVITY_SEED, BETON_PROGRAM_ID};
 
-use crate::{BshError, CompatibleGlobalState, INVENTORY_WALLET, STATE_SEED};
+use crate::{BshError, GlobalState, INVENTORY_WALLET, STATE_SEED};
 
 // =========================================================================
 // Seeds & constants
@@ -42,19 +42,19 @@ pub const BOUNTY_CLAIM_SEED: &[u8] = b"bounty_claim";
 pub const BOUNTY_LOCKED_SUPPLY: u64 = 5_000;
 
 /// Eligibility thresholds (read against the wallet's `Activity` PDA).
-pub const BOUNTY_CREATE_THRESHOLD: u32 = 5;
-pub const BOUNTY_ACCEPT_THRESHOLD: u32 = 5;
-pub const BOUNTY_WIN_THRESHOLD: u32 = 5;
+pub const BOUNTY_MATCHED_THRESHOLD: u32 = 3;
+pub const BOUNTY_WIN_THRESHOLD: u32 = 3;
+pub const BOUNTY_STREAK_THRESHOLD: u32 = 3;
 
 /// Per-wallet payouts (BSH, decimals = 0).
-pub const BOUNTY_CREATE_PAYOUT: u64 = 10;
-pub const BOUNTY_ACCEPT_PAYOUT: u64 = 10;
-pub const BOUNTY_WIN_PAYOUT: u64 = 30;
+pub const BOUNTY_MATCHED_PAYOUT: u64 = 5;
+pub const BOUNTY_WIN_PAYOUT: u64 = 15;
+pub const BOUNTY_STREAK_PAYOUT: u64 = 30;
 
-/// Per-milestone wallet caps. 100 × (10 + 10 + 30) = 5 000 BSH ≡ BOUNTY_LOCKED_SUPPLY.
-pub const BOUNTY_CREATE_MAX_WALLETS: u16 = 100;
-pub const BOUNTY_ACCEPT_MAX_WALLETS: u16 = 100;
+/// Per-milestone wallet caps. 100 × (5 + 15 + 30) = 5 000 BSH ≡ BOUNTY_LOCKED_SUPPLY.
+pub const BOUNTY_MATCHED_MAX_WALLETS: u16 = 100;
 pub const BOUNTY_WIN_MAX_WALLETS: u16 = 100;
+pub const BOUNTY_STREAK_MAX_WALLETS: u16 = 100;
 
 // =========================================================================
 // Accounts
@@ -65,9 +65,9 @@ pub const BOUNTY_WIN_MAX_WALLETS: u16 = 100;
 pub struct BountyConfig {
     pub mint: Pubkey,
     pub vault_token_account: Pubkey,
-    pub create_claimed: u16,
-    pub accept_claimed: u16,
+    pub matched_claimed: u16,
     pub win_claimed: u16,
+    pub streak_claimed: u16,
     pub total_lock: u64,
     pub config_bump: u8,
     pub authority_bump: u8,
@@ -77,11 +77,16 @@ pub struct BountyConfig {
 #[account]
 #[derive(InitSpace, Debug)]
 pub struct BountyClaim {
-    pub claimed_create: bool,
-    pub claimed_accept: bool,
+    pub claimed_matched: bool,
     pub claimed_win: bool,
+    pub claimed_streak: bool,
     pub bump: u8,
-    pub _reserved: [u8; 8],
+    // Audit M1: explicit init flag instead of the unsound `bump == 0` sentinel
+    // (canonical bump can be 0). Double-claim is already prevented by the
+    // `claimed_*` flags; this just removes the fragile pattern. Carved from
+    // `_reserved` so the account layout/size is unchanged.
+    pub initialized: bool,
+    pub _reserved: [u8; 7],
 }
 
 // =========================================================================
@@ -98,7 +103,7 @@ pub struct BountyInitializedEvent {
 #[event]
 pub struct BountyClaimedEvent {
     pub wallet: Pubkey,
-    pub milestone: u8, // 0=create, 1=accept, 2=win
+    pub milestone: u8, // 0=matched, 1=win, 2=streak
     pub payout: u64,
     pub claimed_count: u16,
     pub max_wallets: u16,
@@ -124,9 +129,9 @@ pub(crate) fn initialize_bounty_config(
 ) -> Result<()> {
     config.mint = mint;
     config.vault_token_account = vault_token_account;
-    config.create_claimed = 0;
-    config.accept_claimed = 0;
+    config.matched_claimed = 0;
     config.win_claimed = 0;
+    config.streak_claimed = 0;
     config.total_lock = BOUNTY_LOCKED_SUPPLY;
     config.config_bump = bumps.config;
     config.authority_bump = bumps.authority;
@@ -141,36 +146,36 @@ pub(crate) struct BountyInitBumps {
 }
 
 // =========================================================================
-// claim_bounty_create3 / accept3 / win5
+// claim_bounty_matched3 / win3 / streak3
 // =========================================================================
 
 #[derive(Clone, Copy)]
 enum BountyMilestone {
-    Create,
-    Accept,
+    Matched,
     Win,
+    Streak,
 }
 
 impl BountyMilestone {
     fn payout(&self) -> u64 {
         match self {
-            BountyMilestone::Create => BOUNTY_CREATE_PAYOUT,
-            BountyMilestone::Accept => BOUNTY_ACCEPT_PAYOUT,
+            BountyMilestone::Matched => BOUNTY_MATCHED_PAYOUT,
             BountyMilestone::Win => BOUNTY_WIN_PAYOUT,
+            BountyMilestone::Streak => BOUNTY_STREAK_PAYOUT,
         }
     }
     fn max_wallets(&self) -> u16 {
         match self {
-            BountyMilestone::Create => BOUNTY_CREATE_MAX_WALLETS,
-            BountyMilestone::Accept => BOUNTY_ACCEPT_MAX_WALLETS,
+            BountyMilestone::Matched => BOUNTY_MATCHED_MAX_WALLETS,
             BountyMilestone::Win => BOUNTY_WIN_MAX_WALLETS,
+            BountyMilestone::Streak => BOUNTY_STREAK_MAX_WALLETS,
         }
     }
     fn discriminant(&self) -> u8 {
         match self {
-            BountyMilestone::Create => 0,
-            BountyMilestone::Accept => 1,
-            BountyMilestone::Win => 2,
+            BountyMilestone::Matched => 0,
+            BountyMilestone::Win => 1,
+            BountyMilestone::Streak => 2,
         }
     }
 }
@@ -182,29 +187,30 @@ fn process_bounty_claim(
 ) -> Result<()> {
     let activity = &ctx.activity;
     let satisfies = match milestone {
-        BountyMilestone::Create => activity.bets_created >= BOUNTY_CREATE_THRESHOLD,
-        BountyMilestone::Accept => activity.bets_accepted >= BOUNTY_ACCEPT_THRESHOLD,
+        BountyMilestone::Matched => activity.bets_matched >= BOUNTY_MATCHED_THRESHOLD,
         BountyMilestone::Win => activity.wins_total >= BOUNTY_WIN_THRESHOLD,
+        BountyMilestone::Streak => activity.win_streak >= BOUNTY_STREAK_THRESHOLD,
     };
     require!(satisfies, BshError::RewardIneligible);
 
     let claim = &mut ctx.claim;
-    if claim.bump == 0 {
+    if !claim.initialized {
+        claim.initialized = true;
         claim.bump = bumps.claim;
-        claim._reserved = [0u8; 8];
+        claim._reserved = [0u8; 7];
     }
     let already = match milestone {
-        BountyMilestone::Create => claim.claimed_create,
-        BountyMilestone::Accept => claim.claimed_accept,
+        BountyMilestone::Matched => claim.claimed_matched,
         BountyMilestone::Win => claim.claimed_win,
+        BountyMilestone::Streak => claim.claimed_streak,
     };
     require!(!already, BshError::RewardAlreadyClaimed);
 
     let cfg = &mut ctx.bounty_config;
     let claimed_so_far = match milestone {
-        BountyMilestone::Create => cfg.create_claimed,
-        BountyMilestone::Accept => cfg.accept_claimed,
+        BountyMilestone::Matched => cfg.matched_claimed,
         BountyMilestone::Win => cfg.win_claimed,
+        BountyMilestone::Streak => cfg.streak_claimed,
     };
     require!(
         claimed_so_far < milestone.max_wallets(),
@@ -234,17 +240,17 @@ fn process_bounty_claim(
     )?;
 
     match milestone {
-        BountyMilestone::Create => {
-            cfg.create_claimed = cfg.create_claimed.saturating_add(1);
-            claim.claimed_create = true;
-        }
-        BountyMilestone::Accept => {
-            cfg.accept_claimed = cfg.accept_claimed.saturating_add(1);
-            claim.claimed_accept = true;
+        BountyMilestone::Matched => {
+            cfg.matched_claimed = cfg.matched_claimed.saturating_add(1);
+            claim.claimed_matched = true;
         }
         BountyMilestone::Win => {
             cfg.win_claimed = cfg.win_claimed.saturating_add(1);
             claim.claimed_win = true;
+        }
+        BountyMilestone::Streak => {
+            cfg.streak_claimed = cfg.streak_claimed.saturating_add(1);
+            claim.claimed_streak = true;
         }
     }
 
@@ -254,9 +260,9 @@ fn process_bounty_claim(
         .ok_or(BshError::MathOverflow)?;
 
     let new_count = match milestone {
-        BountyMilestone::Create => cfg.create_claimed,
-        BountyMilestone::Accept => cfg.accept_claimed,
+        BountyMilestone::Matched => cfg.matched_claimed,
         BountyMilestone::Win => cfg.win_claimed,
+        BountyMilestone::Streak => cfg.streak_claimed,
     };
 
     emit!(BountyClaimedEvent {
@@ -269,19 +275,25 @@ fn process_bounty_claim(
     Ok(())
 }
 
-pub fn handle_claim_bounty_create3(ctx: Context<ClaimBounty>) -> Result<()> {
-    let bumps = ClaimBountyLocalBumps { claim: ctx.bumps.claim };
-    process_bounty_claim(ctx.accounts, BountyMilestone::Create, bumps)
+pub fn handle_claim_bounty_matched3(ctx: Context<ClaimBounty>) -> Result<()> {
+    let bumps = ClaimBountyLocalBumps {
+        claim: ctx.bumps.claim,
+    };
+    process_bounty_claim(ctx.accounts, BountyMilestone::Matched, bumps)
 }
 
-pub fn handle_claim_bounty_accept3(ctx: Context<ClaimBounty>) -> Result<()> {
-    let bumps = ClaimBountyLocalBumps { claim: ctx.bumps.claim };
-    process_bounty_claim(ctx.accounts, BountyMilestone::Accept, bumps)
-}
-
-pub fn handle_claim_bounty_win5(ctx: Context<ClaimBounty>) -> Result<()> {
-    let bumps = ClaimBountyLocalBumps { claim: ctx.bumps.claim };
+pub fn handle_claim_bounty_win3(ctx: Context<ClaimBounty>) -> Result<()> {
+    let bumps = ClaimBountyLocalBumps {
+        claim: ctx.bumps.claim,
+    };
     process_bounty_claim(ctx.accounts, BountyMilestone::Win, bumps)
+}
+
+pub fn handle_claim_bounty_streak3(ctx: Context<ClaimBounty>) -> Result<()> {
+    let bumps = ClaimBountyLocalBumps {
+        claim: ctx.bumps.claim,
+    };
+    process_bounty_claim(ctx.accounts, BountyMilestone::Streak, bumps)
 }
 
 #[derive(Clone, Copy)]
@@ -323,6 +335,7 @@ pub struct ClaimBounty<'info> {
     )]
     pub bounty_token_account: Account<'info, TokenAccount>,
 
+    #[account(constraint = mint.key() == bounty_config.mint @ BshError::WrongMint)]
     pub mint: Account<'info, Mint>,
 
     #[account(
@@ -357,9 +370,9 @@ pub struct ClaimBounty<'info> {
 pub fn handle_auto_close_bounty_vault(ctx: Context<AutoCloseBountyVault>) -> Result<()> {
     let cfg = &ctx.accounts.bounty_config;
     require!(
-        cfg.create_claimed >= BOUNTY_CREATE_MAX_WALLETS
-            && cfg.accept_claimed >= BOUNTY_ACCEPT_MAX_WALLETS
-            && cfg.win_claimed >= BOUNTY_WIN_MAX_WALLETS,
+        cfg.matched_claimed >= BOUNTY_MATCHED_MAX_WALLETS
+            && cfg.win_claimed >= BOUNTY_WIN_MAX_WALLETS
+            && cfg.streak_claimed >= BOUNTY_STREAK_MAX_WALLETS,
         BshError::BountyVaultNotEmpty
     );
     require_eq!(
@@ -389,7 +402,7 @@ pub fn handle_auto_close_bounty_vault(ctx: Context<AutoCloseBountyVault>) -> Res
 #[derive(Accounts)]
 pub struct AutoCloseBountyVault<'info> {
     #[account(seeds = [STATE_SEED], bump = state.bumps.state)]
-    pub state: Account<'info, CompatibleGlobalState>,
+    pub state: Account<'info, GlobalState>,
 
     #[account(
         seeds = [BOUNTY_CONFIG_SEED],

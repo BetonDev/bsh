@@ -20,9 +20,6 @@
 )]
 
 // Audit notes (deferred or compatibility-scoped):
-//   * M9 — `GlobalState` now carries the version/reserved fields required by
-//     the audit hardening, but legacy state remains readable under test-mode
-//     until the historical layout can be retired entirely.
 //   * M10 — Historical coverage note retired. The prior follow-ups no longer
 //     describe live risk: `BuyLockedBsh` caps each purchase at 5_000 BSH, so
 //     a >10_000-BSH single-call cross-tier case is unreachable; the
@@ -45,12 +42,14 @@ use anchor_spl::{
 use solana_instructions_sysvar::{
     load_current_index_checked, load_instruction_at_checked, ID as INSTRUCTIONS_SYSVAR_ID,
 };
-use std::{
-    io::Write,
-    ops::{Deref, DerefMut},
-};
-
+// Audit H1: match the on-chain program identity to the deployed address per
+// network. The `mainnet` build feature embeds the canonical mainnet id; every
+// other build (stage devnet, test-mode, IDL) keeps the devnet/stage identity,
+// so a mainnet artifact can never be built with the wrong `declare_id`.
+#[cfg(feature = "mainnet")]
 declare_id!("91ahrFntCbnRAcJhsSQGd4j2QNdiUZTbESA6cJYKeovn");
+#[cfg(not(feature = "mainnet"))]
+declare_id!("7bSkdiZXEUtDT37RwefCJqCZRW9pviUPAAKFHqStkVzw");
 
 // Audit C-2 (production hardening): require an explicit network feature
 // for the on-chain build, mirroring the beton program.
@@ -64,9 +63,7 @@ compile_error!("features `mainnet` and `test-mode` are mutually exclusive");
     not(feature = "idl-build"),
     not(test),
 ))]
-compile_error!(
-    "bsh on-chain build must select exactly one of `mainnet` / `test-mode` features"
-);
+compile_error!("bsh on-chain build must select exactly one of `mainnet` / `test-mode` features");
 
 #[cfg(not(feature = "no-entrypoint"))]
 solana_security_txt::security_txt! {
@@ -102,6 +99,7 @@ const SALE_TIERS: &[(u64, u64)] = &[
 const STATE_SEED: &[u8] = b"state";
 const SOL_VAULT_SEED: &[u8] = b"sol_vault";
 const PAYMENT_ROUTER_SEED: &[u8] = b"payment_router";
+const MIN_PAYMENT_ROUTER_DISTRIBUTION_LAMPORTS: u64 = 10_000;
 // Small data allocation so the vault PDA persists rent-exempt.
 const SOL_VAULT_SPACE: usize = 8;
 
@@ -110,12 +108,20 @@ const SOL_VAULT_SPACE: usize = 8;
 // the upgradable beton program.
 pub mod bounty;
 
+// v3.5 — referral bounty: capped BSH milestone payouts to referrers plus a
+// one-time welcome bounty to referents. Funded by a separate vault from the
+// activity `bounty` module; reads beton's `UserProfile` / `ReferralLink` /
+// `Activity` cross-program with strict owner + seed checks.
+pub mod referral_bounty;
+
 // Anchor's `#[program]` macro generates `crate::__client_accounts_<snake>`
 // for each `Context<Foo>` argument, where the `__client_accounts_*` modules
 // are emitted next to each `#[derive(Accounts)]` definition. Re-export at
 // crate root so they are visible at the path the macro expects.
 #[allow(ambiguous_glob_reexports)]
 pub use bounty::*;
+#[allow(ambiguous_glob_reexports)]
+pub use referral_bounty::*;
 
 #[program]
 pub mod bsh {
@@ -317,6 +323,10 @@ pub mod bsh {
             &ctx.accounts.payment_router.key(),
             quoted_lamports_in,
         )?;
+        require_payment_router_reserve(
+            &ctx.accounts.payment_router.to_account_info(),
+            quoted_lamports_in,
+        )?;
 
         let shared_vsol_share = lamports_in / 2;
         let treasury_share = lamports_in
@@ -454,6 +464,10 @@ pub mod bsh {
             &ctx.accounts.instructions,
             &ctx.accounts.payer.key(),
             &ctx.accounts.payment_router.key(),
+            deposited_lamports,
+        )?;
+        require_payment_router_reserve(
+            &ctx.accounts.payment_router.to_account_info(),
             deposited_lamports,
         )?;
 
@@ -615,22 +629,75 @@ pub mod bsh {
         Ok(())
     }
 
+    /// Permissionlessly drain the BSH payment router into the swap SOL vault
+    /// and treasury 1. Beton reward and bonus claims send their standard 2%
+    /// platform fee here so BSH owns the final vault/treasury split.
+    pub fn distribute_payment_router(ctx: Context<DistributePaymentRouter>) -> Result<()> {
+        let router_info = ctx.accounts.payment_router.to_account_info();
+        // Retain the rent-exempt reserve so the router (a 0-data system PDA)
+        // never drops below rent-exempt. Draining it to 0 left it unable to
+        // receive the sub-rent-exempt router share of Beton reward/jackpot
+        // claims, which aborted those claims with InsufficientFundsForRent.
+        // See docs/FOLLOWUP-router-rent-exemption.md.
+        let rent_reserve = Rent::get()?.minimum_balance(0);
+        let distributable = router_info.lamports().saturating_sub(rent_reserve);
+        require!(
+            distributable >= MIN_PAYMENT_ROUTER_DISTRIBUTION_LAMPORTS,
+            BshError::PaymentRouterEmpty
+        );
+
+        let vault_share = distributable / 2;
+        let treasury_share = distributable
+            .checked_sub(vault_share)
+            .ok_or(BshError::MathOverflow)?;
+
+        route_payment_router_lamports(
+            &router_info,
+            &ctx.accounts.sol_vault.to_account_info(),
+            &ctx.accounts.system_program,
+            ctx.bumps.payment_router,
+            vault_share,
+        )?;
+        route_payment_router_lamports(
+            &router_info,
+            &ctx.accounts.fee_treasury_1.to_account_info(),
+            &ctx.accounts.system_program,
+            ctx.bumps.payment_router,
+            treasury_share,
+        )?;
+
+        emit!(PaymentRouterDistributedEvent {
+            total: distributable,
+            sol_vault: vault_share,
+            fee_treasury_1: treasury_share,
+        });
+
+        Ok(())
+    }
+
+    /// Permissionlessly fund the BSH payment router up to rent-exempt reserve.
+    /// Safe to call on fresh or already-initialized deployments; if the router
+    /// is already rent-exempt the instruction is a no-op.
+    pub fn top_up_payment_router(ctx: Context<TopUpPaymentRouter>) -> Result<()> {
+        handle_top_up_payment_router(ctx)
+    }
+
     // ---------- Bounty ------------------------------------------------
 
-    /// First-100 wallets to create ≥5 bets receive 10 BSH from the bounty
+    /// First-100 wallets to reach 3 matched bets receive 5 BSH from the bounty
     /// vault. Independent of the other two milestones.
-    pub fn claim_bounty_create3(ctx: Context<ClaimBounty>) -> Result<()> {
-        bounty::handle_claim_bounty_create3(ctx)
+    pub fn claim_bounty_matched3(ctx: Context<ClaimBounty>) -> Result<()> {
+        bounty::handle_claim_bounty_matched3(ctx)
     }
 
-    /// First-100 wallets to accept ≥5 bets receive 10 BSH.
-    pub fn claim_bounty_accept3(ctx: Context<ClaimBounty>) -> Result<()> {
-        bounty::handle_claim_bounty_accept3(ctx)
+    /// First-100 wallets to win 3 bets receive 15 BSH.
+    pub fn claim_bounty_win3(ctx: Context<ClaimBounty>) -> Result<()> {
+        bounty::handle_claim_bounty_win3(ctx)
     }
 
-    /// First-100 wallets to win ≥5 bets receive 30 BSH.
-    pub fn claim_bounty_win5(ctx: Context<ClaimBounty>) -> Result<()> {
-        bounty::handle_claim_bounty_win5(ctx)
+    /// First-100 wallets to reach a 3-win streak receive 30 BSH.
+    pub fn claim_bounty_streak3(ctx: Context<ClaimBounty>) -> Result<()> {
+        bounty::handle_claim_bounty_streak3(ctx)
     }
 
     /// Permissionlessly close the bounty ATA once all three milestone caps
@@ -639,33 +706,153 @@ pub mod bsh {
     pub fn auto_close_bounty_vault(ctx: Context<AutoCloseBountyVault>) -> Result<()> {
         bounty::handle_auto_close_bounty_vault(ctx)
     }
+
+    // ---- Referral bounty (v3.5) ----
+
+    /// Upgrade-authority-gated. Creates the referral bounty config + vault ATA
+    /// and atomically locks `REF_BOUNTY_LOCKED_SUPPLY` (20_000 BSH) from the
+    /// canonical inventory wallet.
+    pub fn initialize_referral_bounty(ctx: Context<InitializeReferralBounty>) -> Result<()> {
+        referral_bounty::handle_initialize_referral_bounty(ctx)
+    }
+
+    /// Referrer claims every milestone tier they are newly eligible for, in a
+    /// single instruction. Reads the referrer's beton `UserProfile` for
+    /// cumulative volume + distinct active referent count.
+    pub fn claim_referral_bounty(ctx: Context<ClaimReferralBounty>) -> Result<()> {
+        referral_bounty::handle_claim_referral_bounty(ctx)
+    }
+
+    /// Referent claims the one-time 5 BSH welcome bounty after 3 matched bets
+    /// and meeting the referred-volume floor.
+    pub fn claim_referent_welcome(ctx: Context<ClaimReferentWelcome>) -> Result<()> {
+        referral_bounty::handle_claim_referent_welcome(ctx)
+    }
+
+    /// Permissionlessly close the referral bounty ATA once every cap is hit and
+    /// the vault is empty. Rent flows back to `INVENTORY_WALLET`.
+    pub fn auto_close_referral_bounty_vault(
+        ctx: Context<AutoCloseReferralBountyVault>,
+    ) -> Result<()> {
+        referral_bounty::handle_auto_close_referral_bounty_vault(ctx)
+    }
+
+    /// Upgrade-only migration path for legacy devnet state accounts that were
+    /// initialized before `GlobalState` gained explicit versioning.
+    pub fn migrate_legacy_state(ctx: Context<MigrateLegacyState>) -> Result<()> {
+        handle_migrate_legacy_state(ctx)
+    }
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, InitSpace)]
+struct LegacyGlobalState {
+    pub mint: Pubkey,
+    pub sol_vault: Pubkey,
+    pub vault_token_account: Pubkey,
+    pub sale_token_account: Pubkey,
+    pub total_supply: u64,
+    pub bumps: Bumps,
+}
+
+const LEGACY_GLOBAL_STATE_ACCOUNT_LEN: usize = 8 + LegacyGlobalState::INIT_SPACE;
+
+fn read_legacy_global_state(account_info: &AccountInfo<'_>) -> Result<LegacyGlobalState> {
+    let data = account_info
+        .try_borrow_data()
+        .map_err(|_| error!(BshError::UnsupportedLegacyStateLayout))?;
+    require_eq!(
+        data.len(),
+        LEGACY_GLOBAL_STATE_ACCOUNT_LEN,
+        BshError::UnsupportedLegacyStateLayout
+    );
+    require!(
+        &data[..8] == GlobalState::DISCRIMINATOR,
+        BshError::InvalidLegacyStateDiscriminator
+    );
+
+    let mut payload: &[u8] = &data[8..];
+    let legacy = LegacyGlobalState::deserialize(&mut payload)
+        .map_err(|_| error!(BshError::UnsupportedLegacyStateLayout))?;
+    require!(
+        payload.is_empty(),
+        BshError::UnsupportedLegacyStateLayout
+    );
+    Ok(legacy)
+}
+
+fn handle_migrate_legacy_state(ctx: Context<MigrateLegacyState>) -> Result<()> {
+    let state_info = ctx.accounts.state.to_account_info();
+    let target_len = 8 + GlobalState::INIT_SPACE;
+    let current_len = state_info.data_len();
+
+    if current_len == target_len {
+        return Ok(());
+    }
+
+    require_eq!(
+        current_len,
+        LEGACY_GLOBAL_STATE_ACCOUNT_LEN,
+        BshError::UnsupportedLegacyStateLayout
+    );
+
+    let legacy_state = read_legacy_global_state(&state_info)?;
+    let required_lamports = Rent::get()?.minimum_balance(target_len);
+    let current_lamports = state_info.lamports();
+    if required_lamports > current_lamports {
+        anchor_lang::system_program::transfer(
+            CpiContext::new(
+                system_program::ID,
+                anchor_lang::system_program::Transfer {
+                    from: ctx.accounts.authority.to_account_info(),
+                    to: state_info.clone(),
+                },
+            ),
+            required_lamports.saturating_sub(current_lamports),
+        )?;
+    }
+
+    state_info
+        .resize(target_len)
+        .map_err(|_| error!(BshError::UnsupportedLegacyStateLayout))?;
+
+    let migrated_state = GlobalState {
+        version: GLOBAL_STATE_VERSION,
+        mint: legacy_state.mint,
+        sol_vault: legacy_state.sol_vault,
+        vault_token_account: legacy_state.vault_token_account,
+        sale_token_account: legacy_state.sale_token_account,
+        total_supply: legacy_state.total_supply,
+        bumps: legacy_state.bumps,
+        last_swap_slot: 0,
+        _reserved: [0u8; 23],
+    };
+
+    let mut data = state_info
+        .try_borrow_mut_data()
+        .map_err(|_| error!(BshError::UnsupportedLegacyStateLayout))?;
+    data[..8].copy_from_slice(GlobalState::DISCRIMINATOR);
+    let mut payload: &mut [u8] = &mut data[8..];
+    migrated_state
+        .serialize(&mut payload)
+        .map_err(|_| error!(BshError::UnsupportedLegacyStateLayout))?;
+    Ok(())
 }
 
 fn validate_swap_common(
-    state: &mut Account<CompatibleGlobalState>,
+    state: &mut Account<GlobalState>,
     mint: &Account<Mint>,
     sol_vault: &AccountInfo,
     vault_token_account: &Account<TokenAccount>,
 ) -> Result<()> {
-    // Legacy state remains readable until the PDA is reinitialized.
-    require!(
-        readonly_state_version_is_supported(state.version),
+    require_eq!(
+        state.version,
+        GLOBAL_STATE_VERSION,
         BshError::UnsupportedStateVersion
     );
-    if state.version == GLOBAL_STATE_VERSION {
-        // Audit H-5 (production hardening): admit at most one swap per slot.
-        // This caps single-block sandwich attacks and burst inventory drains.
-        // The clock is a sysvar Anchor injects; the slot value is monotonic.
-        // `last_swap_slot == 0` only on the bootstrap path (Mollusk default
-        // slot is 0; on real chain the tip slot at deploy is always > 0) so
-        // we admit unconditionally then.
-        let slot = Clock::get()?.slot;
-        require!(
-            state.last_swap_slot == 0 || slot > state.last_swap_slot,
-            BshError::SwapRateLimited
-        );
-        state.last_swap_slot = slot;
-    }
+    // Availability now takes precedence over the retired global slot gate.
+    // Keep the latest successful swap slot for telemetry without letting a
+    // dust trade block every other wallet in the same block.
+    state.last_swap_slot = Clock::get()?.slot;
     validate_locked_inventory_layout(
         state.key(),
         mint.key(),
@@ -708,14 +895,14 @@ fn validate_swap_common(
 }
 
 fn validate_locked_sale_common(
-    state: &Account<CompatibleGlobalState>,
+    state: &Account<GlobalState>,
     mint: &Account<Mint>,
     sol_vault: &AccountInfo,
     sale_token_account: &Account<TokenAccount>,
 ) -> Result<()> {
-    // Legacy state remains readable until the PDA is reinitialized.
-    require!(
-        readonly_state_version_is_supported(state.version),
+    require_eq!(
+        state.version,
+        GLOBAL_STATE_VERSION,
         BshError::UnsupportedStateVersion
     );
     validate_locked_inventory_layout(
@@ -774,12 +961,7 @@ fn validate_locked_sale_prefund(
     let funding_ix = load_instruction_at_checked(current_index - 1, instructions_sysvar)
         .map_err(|_| error!(BshError::MissingLockedSaleFundingTransfer))?;
 
-    validate_locked_sale_funding_transfer(
-        &funding_ix,
-        payer,
-        payment_router,
-        quoted_lamports_in,
-    )?;
+    validate_locked_sale_funding_transfer(&funding_ix, payer, payment_router, quoted_lamports_in)?;
 
     Ok(())
 }
@@ -796,12 +978,7 @@ fn validate_swap_sol_prefund(
     let funding_ix = load_instruction_at_checked(current_index - 1, instructions_sysvar)
         .map_err(|_| error!(BshError::MissingSwapFundingTransfer))?;
 
-    validate_swap_funding_transfer(
-        &funding_ix,
-        payer,
-        payment_router,
-        deposited_lamports,
-    )
+    validate_swap_funding_transfer(&funding_ix, payer, payment_router, deposited_lamports)
 }
 
 fn validate_locked_sale_funding_transfer(
@@ -1064,7 +1241,7 @@ fn withdraw_sol_from_swap_vault_for_swap<'info>(
 }
 
 fn close_sale_vault_account<'info>(
-    state: &Account<'info, CompatibleGlobalState>,
+    state: &Account<'info, GlobalState>,
     sale_token_account: &Account<'info, TokenAccount>,
     destination: &AccountInfo<'info>,
     token_program: &Program<'info, Token>,
@@ -1107,8 +1284,15 @@ fn compute_lamports_out(amount: u64, total_supply: u64, sol_balance: u64) -> Res
 }
 
 fn compute_locked_sale_cost(amount: u64, remaining_inventory: u64) -> Result<u64> {
+    // Audit (2026-06-08): clamp `remaining_inventory` to `LOCKED_SUPPLY` before
+    // deriving `sold_before`. Anyone can donate BSH into the state-owned sale ATA,
+    // pushing its balance above `LOCKED_SUPPLY`; without the clamp the
+    // `LOCKED_SUPPLY - remaining_inventory` subtraction underflowed and aborted
+    // EVERY sale buy (and blocked auto-close) — a free DoS. Clamping treats an
+    // over-funded ATA as "nothing sold yet" (tier-1 pricing), which is correct:
+    // donated tokens are not legitimate sales.
     let mut sold_before = LOCKED_SUPPLY
-        .checked_sub(remaining_inventory)
+        .checked_sub(remaining_inventory.min(LOCKED_SUPPLY))
         .ok_or(BshError::MathOverflow)?;
     let mut remaining_to_price = amount;
     let mut total_cost = 0u128;
@@ -1169,6 +1353,16 @@ pub struct Initialize<'info> {
     )]
     /// CHECK: Vault is a program-owned PDA (validated via seeds)
     pub sol_vault: UncheckedAccount<'info>,
+    #[account(
+        init,
+        payer = authority,
+        space = 0,
+        owner = system_program::ID,
+        seeds = [PAYMENT_ROUTER_SEED],
+        bump
+    )]
+    /// CHECK: System-owned lamports-only PDA used as the SOL payment router.
+    pub payment_router: UncheckedAccount<'info>,
     pub inventory_owner: Signer<'info>,
     pub mint: Account<'info, Mint>,
     #[account(
@@ -1222,11 +1416,29 @@ pub struct Initialize<'info> {
 }
 
 #[derive(Accounts)]
+pub struct MigrateLegacyState<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(
+        constraint = program.programdata_address()? == Some(program_data.key()) @ BshError::InvalidProgramData
+    )]
+    pub program: Program<'info, crate::program::Bsh>,
+    #[account(
+        constraint = program_data.upgrade_authority_address == Some(authority.key()) @ BshError::UnauthorizedInitializer
+    )]
+    pub program_data: Account<'info, ProgramData>,
+    #[account(mut, seeds = [STATE_SEED], bump, owner = crate::ID)]
+    /// CHECK: legacy state layout is deserialized manually and rewritten in-place.
+    pub state: UncheckedAccount<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
 pub struct BuyLockedBsh<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
     #[account(seeds = [STATE_SEED], bump = state.bumps.state)]
-    pub state: Account<'info, CompatibleGlobalState>,
+    pub state: Account<'info, GlobalState>,
     pub mint: Account<'info, Mint>,
     #[account(
         mut,
@@ -1254,7 +1466,7 @@ pub struct BuyLockedBsh<'info> {
 #[derive(Accounts)]
 pub struct AutoCloseSaleVault<'info> {
     #[account(seeds = [STATE_SEED], bump = state.bumps.state)]
-    pub state: Account<'info, CompatibleGlobalState>,
+    pub state: Account<'info, GlobalState>,
     pub mint: Account<'info, Mint>,
     #[account(
         seeds = [SOL_VAULT_SEED],
@@ -1275,7 +1487,7 @@ pub struct SwapSolForBsh<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
     #[account(mut, seeds = [STATE_SEED], bump = state.bumps.state)]
-    pub state: Account<'info, CompatibleGlobalState>,
+    pub state: Account<'info, GlobalState>,
     pub mint: Account<'info, Mint>,
     #[account(
         mut,
@@ -1299,11 +1511,42 @@ pub struct SwapSolForBsh<'info> {
 }
 
 #[derive(Accounts)]
+pub struct DistributePaymentRouter<'info> {
+    #[account(mut)]
+    pub caller: Signer<'info>,
+    #[account(mut, seeds = [PAYMENT_ROUTER_SEED], bump)]
+    pub payment_router: SystemAccount<'info>,
+    #[account(
+        mut,
+        seeds = [SOL_VAULT_SEED],
+        bump,
+        owner = crate::ID
+    )]
+    /// CHECK: BSH swap SOL vault PDA.
+    pub sol_vault: UncheckedAccount<'info>,
+    #[account(mut, address = BETON_TREASURY_1)]
+    pub fee_treasury_1: SystemAccount<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct TopUpPaymentRouter<'info> {
+    #[account(mut)]
+    pub funder: Signer<'info>,
+
+    #[account(mut, seeds = [PAYMENT_ROUTER_SEED], bump, owner = system_program::ID)]
+    /// CHECK: System-owned lamports-only PDA used as the SOL payment router.
+    pub payment_router: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
 pub struct SwapBshForSol<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
     #[account(mut, seeds = [STATE_SEED], bump = state.bumps.state)]
-    pub state: Account<'info, CompatibleGlobalState>,
+    pub state: Account<'info, GlobalState>,
     pub mint: Account<'info, Mint>,
     #[account(
         mut,
@@ -1337,10 +1580,11 @@ pub struct GlobalState {
     pub sale_token_account: Pubkey,
     pub total_supply: u64,
     pub bumps: Bumps,
-    /// Audit H-5 (production hardening): slot of the last successful swap
-    /// (either direction). Enforced by `validate_swap_common` to admit at
-    /// most one swap per slot — caps atomic-bundle MEV sandwich attacks
-    /// and DoS-burst inventory drains without requiring per-wallet PDAs.
+    /// Slot of the last successful swap (either direction).
+    ///
+    /// Retained for layout compatibility and swap telemetry. It is no longer
+    /// used as a global admission gate because one-swap-per-slot allowed
+    /// dust trades to grief every other user at block level.
     pub last_swap_slot: u64,
     /// Reserved compatibility bytes for future non-governance layout needs.
     /// If upgrade authority is intentionally revoked in the final swap-only
@@ -1351,134 +1595,6 @@ pub struct GlobalState {
 /// Audit H-7: current `GlobalState` schema version. Bump whenever any
 /// field semantics change; readers MUST reject unknown versions.
 pub const GLOBAL_STATE_VERSION: u8 = 1;
-
-const LEGACY_GLOBAL_STATE_VERSION: u8 = 0;
-const LEGACY_GLOBAL_STATE_LAST_SWAP_SLOT: u64 = 0;
-const LEGACY_GLOBAL_STATE_ACCOUNT_SIZE: usize = 147;
-const LEGACY_GLOBAL_STATE_RESERVED: [u8; 23] = [0u8; 23];
-
-#[cfg(any(test, feature = "test-mode"))]
-const ACCEPT_LEGACY_GLOBAL_STATE: bool = true;
-#[cfg(not(any(test, feature = "test-mode")))]
-const ACCEPT_LEGACY_GLOBAL_STATE: bool = false;
-
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
-struct LegacyGlobalStateWire {
-    mint: Pubkey,
-    sol_vault: Pubkey,
-    vault_token_account: Pubkey,
-    sale_token_account: Pubkey,
-    total_supply: u64,
-    bumps: Bumps,
-}
-
-#[derive(Clone)]
-pub struct CompatibleGlobalState(GlobalState);
-
-impl Deref for CompatibleGlobalState {
-    type Target = GlobalState;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl DerefMut for CompatibleGlobalState {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl Discriminator for CompatibleGlobalState {
-    const DISCRIMINATOR: &'static [u8] = GlobalState::DISCRIMINATOR;
-}
-
-impl Owner for CompatibleGlobalState {
-    fn owner() -> Pubkey {
-        crate::ID
-    }
-}
-
-impl AccountSerialize for CompatibleGlobalState {
-    fn try_serialize<W: Write>(&self, writer: &mut W) -> Result<()> {
-        if self.0.version == LEGACY_GLOBAL_STATE_VERSION {
-            writer.write_all(GlobalState::DISCRIMINATOR)?;
-            AnchorSerialize::serialize(
-                &LegacyGlobalStateWire {
-                    mint: self.0.mint,
-                    sol_vault: self.0.sol_vault,
-                    vault_token_account: self.0.vault_token_account,
-                    sale_token_account: self.0.sale_token_account,
-                    total_supply: self.0.total_supply,
-                    bumps: self.0.bumps,
-                },
-                writer,
-            )?;
-            return Ok(());
-        }
-
-        self.0.try_serialize(writer)
-    }
-}
-
-impl AccountDeserialize for CompatibleGlobalState {
-    fn try_deserialize(buf: &mut &[u8]) -> Result<Self> {
-        if buf.len() < GlobalState::DISCRIMINATOR.len() {
-            return Err(anchor_lang::error::ErrorCode::AccountDiscriminatorNotFound.into());
-        }
-
-        let discriminator = &buf[..GlobalState::DISCRIMINATOR.len()];
-        if discriminator != GlobalState::DISCRIMINATOR {
-            return Err(anchor_lang::error::ErrorCode::AccountDiscriminatorMismatch.into());
-        }
-
-        Self::try_deserialize_unchecked(buf)
-    }
-
-    fn try_deserialize_unchecked(buf: &mut &[u8]) -> Result<Self> {
-        if ACCEPT_LEGACY_GLOBAL_STATE && buf.len() == LEGACY_GLOBAL_STATE_ACCOUNT_SIZE {
-            let mut data = &buf[GlobalState::DISCRIMINATOR.len()..];
-            let legacy: LegacyGlobalStateWire = AnchorDeserialize::deserialize(&mut data)
-                .map_err(|_| anchor_lang::error::ErrorCode::AccountDidNotDeserialize)?;
-
-            return Ok(Self(GlobalState {
-                version: LEGACY_GLOBAL_STATE_VERSION,
-                mint: legacy.mint,
-                sol_vault: legacy.sol_vault,
-                vault_token_account: legacy.vault_token_account,
-                sale_token_account: legacy.sale_token_account,
-                total_supply: legacy.total_supply,
-                bumps: legacy.bumps,
-                last_swap_slot: LEGACY_GLOBAL_STATE_LAST_SWAP_SLOT,
-                _reserved: LEGACY_GLOBAL_STATE_RESERVED,
-            }));
-        }
-
-        GlobalState::try_deserialize_unchecked(buf).map(Self)
-    }
-}
-
-#[cfg(feature = "idl-build")]
-impl IdlBuild for CompatibleGlobalState {
-    fn create_type() -> Option<anchor_lang::idl::types::IdlTypeDef> {
-        GlobalState::create_type()
-    }
-
-    fn insert_types(
-        types: &mut std::collections::BTreeMap<String, anchor_lang::idl::types::IdlTypeDef>,
-    ) {
-        GlobalState::insert_types(types);
-    }
-
-    fn get_full_path() -> String {
-        GlobalState::get_full_path()
-    }
-}
-
-fn readonly_state_version_is_supported(version: u8) -> bool {
-    version == GLOBAL_STATE_VERSION
-        || (ACCEPT_LEGACY_GLOBAL_STATE && version == LEGACY_GLOBAL_STATE_VERSION)
-}
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Default, InitSpace)]
 pub struct Bumps {
@@ -1514,12 +1630,72 @@ pub struct LockedSaleEvent {
     pub sold_out: bool,
 }
 
+#[event]
+pub struct PaymentRouterDistributedEvent {
+    pub total: u64,
+    pub sol_vault: u64,
+    pub fee_treasury_1: u64,
+}
+
+#[event]
+pub struct PaymentRouterFundedEvent {
+    pub funder: Pubkey,
+    pub amount: u64,
+    pub balance_after: u64,
+}
+
 fn ensure_system_account(account: &AccountInfo) -> Result<()> {
     require_keys_eq!(
         *account.owner,
         system_program::ID,
         BshError::AccountNotSystemOwned
     );
+    Ok(())
+}
+
+fn payment_router_rent_reserve() -> Result<u64> {
+    Ok(Rent::get()?.minimum_balance(0))
+}
+
+fn require_payment_router_reserve(payment_router: &AccountInfo, routed_amount: u64) -> Result<()> {
+    let reserve = payment_router_rent_reserve()?;
+    let remaining = payment_router
+        .lamports()
+        .checked_sub(routed_amount)
+        .ok_or(BshError::PaymentRouterBelowRentReserve)?;
+    require!(
+        remaining >= reserve,
+        BshError::PaymentRouterBelowRentReserve
+    );
+    Ok(())
+}
+
+fn handle_top_up_payment_router(ctx: Context<TopUpPaymentRouter>) -> Result<()> {
+    ensure_system_account(&ctx.accounts.funder.to_account_info())?;
+
+    let router_info = ctx.accounts.payment_router.to_account_info();
+    let reserve = payment_router_rent_reserve()?;
+    let current = router_info.lamports();
+    let amount = reserve.saturating_sub(current);
+
+    if amount > 0 {
+        system_program::transfer(
+            CpiContext::new(
+                ctx.accounts.system_program.key(),
+                system_program::Transfer {
+                    from: ctx.accounts.funder.to_account_info(),
+                    to: router_info.clone(),
+                },
+            ),
+            amount,
+        )?;
+    }
+
+    emit!(PaymentRouterFundedEvent {
+        funder: ctx.accounts.funder.key(),
+        amount,
+        balance_after: current.checked_add(amount).ok_or(BshError::MathOverflow)?,
+    });
     Ok(())
 }
 
@@ -1652,7 +1828,11 @@ pub enum BshError {
     // ---- Schema versioning (Audit H-7) ----
     #[msg("Account schema version is unsupported by this program build")]
     UnsupportedStateVersion,
-    #[msg("At most one swap is permitted per slot; retry next block")]
+    #[msg("Legacy global state account layout is unsupported by this migration path")]
+    UnsupportedLegacyStateLayout,
+    #[msg("Legacy global state discriminator is invalid")]
+    InvalidLegacyStateDiscriminator,
+    #[msg("Legacy reserved error code for the retired global swap slot limiter")]
     SwapRateLimited,
     #[msg("Locked-sale quote no longer matches the on-chain tiered price")]
     LockedSaleQuoteMismatch,
@@ -1664,6 +1844,17 @@ pub enum BshError {
     MissingSwapFundingTransfer,
     #[msg("SOL to BSH funding transfer into the payment router is missing or malformed")]
     InvalidSwapFundingTransfer,
+    #[msg("Payment router has nothing to distribute")]
+    PaymentRouterEmpty,
+    #[msg("Payment router must retain its rent-exempt reserve after routing")]
+    PaymentRouterBelowRentReserve,
+    // ---- Referral bounty (v3.5) ----
+    #[msg("Referral bounty config / vault account mismatch")]
+    ReferralBountyConfigMismatch,
+    #[msg("No referral bounty tier is currently claimable for this wallet")]
+    NoReferralBountyClaimable,
+    #[msg("Referral account is not owned by the beton program or fails seed derivation")]
+    ReferralAccountInvalid,
 }
 
 #[cfg(test)]
@@ -1884,6 +2075,11 @@ mod tests {
         );
 
         harness.store_account(
+            payment_router,
+            funded_system_account(harness.rent_exempt_lamports(0)),
+        );
+
+        harness.store_account(
             vault_token_account,
             packed_token_account(
                 SplTokenAccount {
@@ -2001,6 +2197,19 @@ mod tests {
     }
 
     #[test]
+    fn compute_locked_sale_cost_tolerates_donated_over_balance() {
+        // Audit regression: a donated over-balance (remaining_inventory above
+        // LOCKED_SUPPLY) must NOT underflow/abort. It is clamped to "nothing
+        // sold yet" → tier-1 pricing, identical to remaining_inventory == LOCKED_SUPPLY.
+        let donated =
+            compute_locked_sale_cost(1, LOCKED_SUPPLY + 5_000).expect("donated over-balance must price, not abort");
+        assert_eq!(donated, 100_000_000); // tier one @ 0.1 SOL
+        let baseline =
+            compute_locked_sale_cost(1, LOCKED_SUPPLY).expect("baseline tier one");
+        assert_eq!(donated, baseline);
+    }
+
+    #[test]
     fn validate_locked_inventory_layout_accepts_canonical_accounts() {
         let state_key = Pubkey::new_unique();
         let sol_vault = Pubkey::new_unique();
@@ -2068,12 +2277,9 @@ mod tests {
 
         harness.process(
             &instruction,
-            &[Check::err(
-                solana_sdk::program_error::ProgramError::Custom(
-                    anchor_lang::error::ERROR_CODE_OFFSET
-                        + BshError::MissingSwapFundingTransfer as u32,
-                ),
-            )],
+            &[Check::err(solana_sdk::program_error::ProgramError::Custom(
+                anchor_lang::error::ERROR_CODE_OFFSET + BshError::MissingSwapFundingTransfer as u32,
+            ))],
         );
     }
 

@@ -7,7 +7,7 @@
 | Review date             | 2026-04-30                                                                                                                                                  |
 | Review basis            | Private review of the closed-source on-chain repository snapshot current on the review date                                                                 |
 | Systems in scope        | BETON mainnet program and BSH mainnet program                                                                                                               |
-| Public program IDs      | BETON `BpwBgBZ8WFDk7BswjJNoepmisZS1KfuoKbybCLaF5Hj6`, BSH `91ahrFntCbnRAcJhsSQGd4j2QNdiUZTbESA6cJYKeovn`                                                    |
+| Public program IDs      | BETON `H2L6jmyc9bTZdU4hKTuWArok6n8UZvS1nGNGaks3z6Ce`, BSH `91ahrFntCbnRAcJhsSQGd4j2QNdiUZTbESA6cJYKeovn`                                                    |
 | Public disclosure model | This document is a public summary. Internal source paths, implementation excerpts, non-public constants, and reviewer workpapers are intentionally omitted. |
 
 > This report is formatted for public disclosure while the source repository remains closed. It summarizes security conclusions and operating considerations without exposing non-public implementation detail.

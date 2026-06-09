@@ -3,13 +3,10 @@ members = [
     "programs/*",
     "crates/*"
 ]
-exclude = [
-    "programs/*/fuzz"
-]
 resolver = "2"
 
 [workspace.metadata.cli]
-solana = "3.1.14"
+solana = "4.0.1"
 
 [profile.release]
 overflow-checks = true

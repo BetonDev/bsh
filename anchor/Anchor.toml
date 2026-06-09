@@ -1,21 +1,20 @@
 [toolchain]
-anchor_version = "1.0.1"
+anchor_version = "1.0.2"
 package_manager = "pnpm"
 
 [features]
 resolution = true
 skip-lint = false
 
+# Audit H1: the mainnet deploy guard (scripts/guard-mainnet-deploy.mjs) requires
+# an explicit [features.mainnet] selecting only the `mainnet` build feature so a
+# mainnet artifact can never be produced with the wrong network identity.
 [features.mainnet]
-beton = ["mainnet"]
-bsh = ["mainnet"]
+mainnet = ["mainnet"]
 
 [programs.mainnet]
-beton = "BpwBgBZ8WFDk7BswjJNoepmisZS1KfuoKbybCLaF5Hj6"
+beton = "HSVohDX9Y2AHwsixSU6wMR29nwyYZgYKuKqrwaeQfLaz"
 bsh = "91ahrFntCbnRAcJhsSQGd4j2QNdiUZTbESA6cJYKeovn"
-
-[registry]
-url = "https://api.apr.dev"
 
 [provider]
 cluster = "mainnet"
@@ -23,3 +22,5 @@ wallet = "~/.config/solana/id.json"
 
 [scripts]
 test = "vitest"
+
+[hooks]

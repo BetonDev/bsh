@@ -1,6 +1,6 @@
 [package]
 name = "bsh"
-version = "2.1.7"
+version = "1.4.2"
 description = "Created with Anchor"
 edition = "2021"
 
@@ -20,8 +20,8 @@ test-mode = []
 
 
 [dependencies]
-anchor-lang = { version = "1.0.1", features = ["init-if-needed"] }
-anchor-spl = { version = "1.0.1", features = ["metadata"] }
+anchor-lang = { version = "1.0.2", features = ["init-if-needed"] }
+anchor-spl = { version = "1.0.2", features = ["metadata"] }
 beton-shared-types = { path = "../../crates/shared-types" }
 solana-instructions-sysvar = "3.0.0"
 solana-sdk-ids = "2.2.1"
