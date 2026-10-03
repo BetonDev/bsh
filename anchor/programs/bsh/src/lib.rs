@@ -958,6 +958,15 @@ fn validate_locked_sale_prefund(
         BshError::MissingLockedSaleFundingTransfer
     );
 
+    // Audit (CPI prefund reuse): see `validate_swap_sol_prefund`. The same
+    // top-level-index property lets a caller CPI-stack buys behind one funding
+    // transfer; require a direct top-level bsh invocation so the preceding
+    // transfer cannot be shared across multiple nested buys.
+    require!(
+        is_top_level_bsh_invocation(instructions_sysvar, current_index)?,
+        BshError::LockedSaleMustBeTopLevel
+    );
+
     let funding_ix = load_instruction_at_checked(current_index - 1, instructions_sysvar)
         .map_err(|_| error!(BshError::MissingLockedSaleFundingTransfer))?;
 
@@ -975,10 +984,39 @@ fn validate_swap_sol_prefund(
     let current_index = usize::from(load_current_index_checked(instructions_sysvar)?);
     require!(current_index > 0, BshError::MissingSwapFundingTransfer);
 
+    // Audit (CPI prefund reuse): the instructions-sysvar "current index" is the
+    // index of the executing *top-level* instruction and is NOT advanced across
+    // CPI. Without this guard a caller program could invoke this swap via CPI
+    // several times inside a single top-level instruction, each reusing the one
+    // preceding funding transfer at `current_index - 1`, and route the shared
+    // payment router's pre-existing (beton-fee) balance into the swap vault
+    // repeatedly for one real deposit. Require the executing instruction to be a
+    // direct top-level bsh invocation so that `current_index - 1` is the
+    // genuine, unconsumed funding transfer for exactly this call.
+    require!(
+        is_top_level_bsh_invocation(instructions_sysvar, current_index)?,
+        BshError::SwapMustBeTopLevel
+    );
+
     let funding_ix = load_instruction_at_checked(current_index - 1, instructions_sysvar)
         .map_err(|_| error!(BshError::MissingSwapFundingTransfer))?;
 
     validate_swap_funding_transfer(&funding_ix, payer, payment_router, deposited_lamports)
+}
+
+/// Returns true iff the currently executing instruction (at `current_index` in
+/// the instructions sysvar) is a direct top-level invocation of this program.
+///
+/// Because the sysvar's current index is not updated across CPI, a bsh handler
+/// reached via CPI sees `current_index` pointing at the *caller's* top-level
+/// instruction (program id != bsh). Prefund introspection therefore trusts
+/// `current_index - 1` only when this is a direct top-level bsh call.
+fn is_top_level_bsh_invocation(
+    instructions_sysvar: &AccountInfo,
+    current_index: usize,
+) -> Result<bool> {
+    let current_ix = load_instruction_at_checked(current_index, instructions_sysvar)?;
+    Ok(current_ix.program_id == crate::ID)
 }
 
 fn validate_locked_sale_funding_transfer(
@@ -1855,6 +1893,12 @@ pub enum BshError {
     NoReferralBountyClaimable,
     #[msg("Referral account is not owned by the beton program or fails seed derivation")]
     ReferralAccountInvalid,
+    // ---- CPI prefund-reuse hardening ----
+    // Appended at the end so existing error-code discriminants are unchanged.
+    #[msg("SOL to BSH swap must be a direct top-level instruction, not a CPI")]
+    SwapMustBeTopLevel,
+    #[msg("Locked-sale buy must be a direct top-level instruction, not a CPI")]
+    LockedSaleMustBeTopLevel,
 }
 
 #[cfg(test)]
