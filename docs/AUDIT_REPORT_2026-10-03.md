@@ -18,7 +18,7 @@
 | ID    | Title                                                                 | Severity      | Status in this branch |
 | ----- | -------------------------------------------------------------------- | ------------- | --------------------- |
 | H-1   | Prefund funding transfer is reusable across CPI-stacked swaps/buys  | **High**      | Fixed (code)          |
-| L-1   | Published source cannot build its own test suite                     | Low           | Reported              |
+| L-1   | Published source cannot build its own test suite                     | Low           | Default path fixed    |
 | I-1   | AMM has no fee and prices on fixed `total_supply`                    | Informational | Reported              |
 | I-2   | Swap / locked-sale buy are now restricted to top-level invocation    | Informational | Documented            |
 | I-3   | No `.gitignore`; build artifacts easy to commit by accident          | Informational | Fixed (added)         |
@@ -146,12 +146,39 @@ The program's compiled bytecode is unaffected (tests are not linked into the
 `.so`), so this is not an exploitable on-chain flaw — but it undermines the
 stated verification workflow and provenance guarantees.
 
-**Recommendation:** restore the omitted test module files and the dev-dependency
-declarations so the documented gate runs, or, if the public tree is
-intentionally sanitized of tests, remove the stale `mod` declarations and update
-`SECURITY.md` to describe the verification that actually applies to the public
-source. (Not fixed here: the original test module contents are not available in
-this tree to restore faithfully.)
+**Remediation applied in this branch (default test path):**
+
+- Removed the two dangling `mod mollusk_tests; / mod program_tests;`
+  declarations (those external suites were omitted from the public tree and
+  cannot be restored faithfully here).
+- Added the missing dev-dependency (`solana-instruction`) and moved the
+  pure-logic unit tests into a `logic_tests` module.
+- The inline Mollusk harness needs a prebuilt SBF artifact and the full Solana
+  test toolchain, so it is now gated behind an opt-in `sbf-tests` cargo feature
+  (`mollusk-svm` / `solana-sdk` are declared as optional dependencies). It is
+  preserved for the team's own toolchain; it was **not** compiled in the audit
+  sandbox, whose `rustc 1.97.0` is below the `1.97.1` required by mollusk-svm's
+  transitive Solana-SVM crates, and its version pins may need alignment with the
+  team's toolchain.
+
+As a result, `cargo test -p bsh --lib` now compiles and passes (18 tests,
+including the H-1 regression tests below) with a plain stable toolchain and no
+SBF artifact — restoring the default verification path. The full
+`SECURITY.md` gate (which also exercises the Mollusk integration tests) still
+requires the team to restore the omitted external suites and/or run
+`cargo test -p bsh --features sbf-tests` after `anchor build --features
+test-mode`; `SECURITY.md` should be updated to describe this split, or the
+external suites re-added.
+
+**H-1 regression tests (added here, run by default):** `logic_tests` builds a
+synthetic instructions sysvar reproducing the account state a CPI-stacked call
+produces (the top-level instruction at the sysvar's current index is a foreign
+program; the reused funding transfer sits at `current_index - 1`) and asserts
+`validate_swap_sol_prefund` / `validate_locked_sale_prefund` now reject it with
+`SwapMustBeTopLevel` / `LockedSaleMustBeTopLevel`, plus positive cases for a
+genuine top-level call. These lock in the H-1 fix without a second on-chain
+program or the SBF toolchain. An end-to-end two-program CPI test under
+`sbf-tests` remains a nice-to-have.
 
 ---
 
