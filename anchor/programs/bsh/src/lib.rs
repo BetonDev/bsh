@@ -958,6 +958,15 @@ fn validate_locked_sale_prefund(
         BshError::MissingLockedSaleFundingTransfer
     );
 
+    // Audit (CPI prefund reuse): see `validate_swap_sol_prefund`. The same
+    // top-level-index property lets a caller CPI-stack buys behind one funding
+    // transfer; require a direct top-level bsh invocation so the preceding
+    // transfer cannot be shared across multiple nested buys.
+    require!(
+        is_top_level_bsh_invocation(instructions_sysvar, current_index)?,
+        BshError::LockedSaleMustBeTopLevel
+    );
+
     let funding_ix = load_instruction_at_checked(current_index - 1, instructions_sysvar)
         .map_err(|_| error!(BshError::MissingLockedSaleFundingTransfer))?;
 
@@ -975,10 +984,39 @@ fn validate_swap_sol_prefund(
     let current_index = usize::from(load_current_index_checked(instructions_sysvar)?);
     require!(current_index > 0, BshError::MissingSwapFundingTransfer);
 
+    // Audit (CPI prefund reuse): the instructions-sysvar "current index" is the
+    // index of the executing *top-level* instruction and is NOT advanced across
+    // CPI. Without this guard a caller program could invoke this swap via CPI
+    // several times inside a single top-level instruction, each reusing the one
+    // preceding funding transfer at `current_index - 1`, and route the shared
+    // payment router's pre-existing (beton-fee) balance into the swap vault
+    // repeatedly for one real deposit. Require the executing instruction to be a
+    // direct top-level bsh invocation so that `current_index - 1` is the
+    // genuine, unconsumed funding transfer for exactly this call.
+    require!(
+        is_top_level_bsh_invocation(instructions_sysvar, current_index)?,
+        BshError::SwapMustBeTopLevel
+    );
+
     let funding_ix = load_instruction_at_checked(current_index - 1, instructions_sysvar)
         .map_err(|_| error!(BshError::MissingSwapFundingTransfer))?;
 
     validate_swap_funding_transfer(&funding_ix, payer, payment_router, deposited_lamports)
+}
+
+/// Returns true iff the currently executing instruction (at `current_index` in
+/// the instructions sysvar) is a direct top-level invocation of this program.
+///
+/// Because the sysvar's current index is not updated across CPI, a bsh handler
+/// reached via CPI sees `current_index` pointing at the *caller's* top-level
+/// instruction (program id != bsh). Prefund introspection therefore trusts
+/// `current_index - 1` only when this is a direct top-level bsh call.
+fn is_top_level_bsh_invocation(
+    instructions_sysvar: &AccountInfo,
+    current_index: usize,
+) -> Result<bool> {
+    let current_ix = load_instruction_at_checked(current_index, instructions_sysvar)?;
+    Ok(current_ix.program_id == crate::ID)
 }
 
 fn validate_locked_sale_funding_transfer(
@@ -1855,14 +1893,24 @@ pub enum BshError {
     NoReferralBountyClaimable,
     #[msg("Referral account is not owned by the beton program or fails seed derivation")]
     ReferralAccountInvalid,
+    // ---- CPI prefund-reuse hardening ----
+    // Appended at the end so existing error-code discriminants are unchanged.
+    #[msg("SOL to BSH swap must be a direct top-level instruction, not a CPI")]
+    SwapMustBeTopLevel,
+    #[msg("Locked-sale buy must be a direct top-level instruction, not a CPI")]
+    LockedSaleMustBeTopLevel,
 }
 
-#[cfg(test)]
-mod mollusk_tests;
-#[cfg(test)]
-mod program_tests;
-
-#[cfg(test)]
+// Audit L-1: the external integration suites `mollusk_tests` and
+// `program_tests` referenced here were omitted from the published source
+// tree, so their `mod` declarations are removed to let the crate build its
+// tests. The Mollusk harness below needs a prebuilt SBF artifact and is
+// gated behind the `sbf-tests` feature: run
+//   anchor build --features test-mode
+//   cargo test -p bsh --features sbf-tests
+// Pure-logic and H-1 introspection-guard tests live in `logic_tests` and
+// run under a plain `cargo test -p bsh --lib`.
+#[cfg(all(test, feature = "sbf-tests"))]
 mod tests {
     use super::*;
     use anchor_lang::solana_program::{program_option::COption, program_pack::Pack};
@@ -2125,6 +2173,87 @@ mod tests {
     }
 
     #[test]
+    fn mollusk_swap_sol_for_bsh_requires_prefunding_transfer() {
+        let harness = BshTestHarness::new();
+        let fixture = setup_swap_fixture(&harness, 90_000, 10_000, 5_000_000);
+        let deposited_lamports = 1_000_000u64;
+
+        let instruction = Instruction {
+            program_id: to_address(crate::ID),
+            accounts: to_sdk_account_metas(
+                crate::accounts::SwapSolForBsh {
+                    payer: fixture.payer,
+                    state: fixture.state,
+                    mint: fixture.mint,
+                    sol_vault: fixture.sol_vault,
+                    payment_router: fixture.payment_router,
+                    vault_token_account: fixture.vault_token_account,
+                    payer_token_account: fixture.user_token_account,
+                    instructions: solana_instructions_sysvar::ID,
+                    token_program: spl_token::ID,
+                    system_program: system_program::ID,
+                }
+                .to_account_metas(None),
+            ),
+            data: crate::instruction::SwapSolForBsh {
+                deposited_lamports,
+                min_tokens_out: 1,
+            }
+            .data(),
+        };
+
+        harness.process(
+            &instruction,
+            &[Check::err(solana_sdk::program_error::ProgramError::Custom(
+                anchor_lang::error::ERROR_CODE_OFFSET + BshError::MissingSwapFundingTransfer as u32,
+            ))],
+        );
+    }
+
+    #[test]
+    fn mollusk_swap_bsh_for_sol_reaches_token_cpi_boundary() {
+        let harness = BshTestHarness::new();
+        let fixture = setup_swap_fixture(&harness, 80_000, 20_000, 5_000_000);
+        let amount = 20_000u64;
+
+        let instruction = Instruction {
+            program_id: to_address(crate::ID),
+            accounts: to_sdk_account_metas(
+                crate::accounts::SwapBshForSol {
+                    payer: fixture.payer,
+                    state: fixture.state,
+                    mint: fixture.mint,
+                    sol_vault: fixture.sol_vault,
+                    vault_token_account: fixture.vault_token_account,
+                    user_token_account: fixture.user_token_account,
+                    token_program: spl_token::ID,
+                    system_program: system_program::ID,
+                }
+                .to_account_metas(None),
+            ),
+            data: crate::instruction::SwapBshForSol {
+                amount,
+                min_lamports_out: 1,
+            }
+            .data(),
+        };
+
+        harness.process(
+            &instruction,
+            &[Check::instruction_err(
+                InstructionError::UnsupportedProgramId,
+            )],
+        );
+    }
+}
+
+#[cfg(test)]
+mod logic_tests {
+    use super::*;
+    use solana_instruction::{BorrowedAccountMeta, BorrowedInstruction};
+    use solana_instructions_sysvar::{construct_instructions_data, store_current_index_checked};
+
+    #[test]
     fn test_id() {
         assert_eq!(crate::id(), ID);
     }
@@ -2245,77 +2374,155 @@ mod tests {
         assert_eq!(err, error!(BshError::SaleInventoryMustRemainIsolated));
     }
 
-    #[test]
-    fn mollusk_swap_sol_for_bsh_requires_prefunding_transfer() {
-        let harness = BshTestHarness::new();
-        let fixture = setup_swap_fixture(&harness, 90_000, 10_000, 5_000_000);
-        let deposited_lamports = 1_000_000u64;
+    // =====================================================================
+    // Audit H-1 regression: prefund introspection must reject CPI-stacked
+    // swaps / locked-sale buys. These build a synthetic instructions sysvar
+    // (no SBF artifact / second program needed) reproducing the account state
+    // a CPI-stacked call produces: the top-level instruction at the sysvar's
+    // current index belongs to a foreign program, with the reused funding
+    // transfer at current_index - 1.
+    // =====================================================================
 
-        let instruction = Instruction {
-            program_id: to_address(crate::ID),
-            accounts: to_sdk_account_metas(
-                crate::accounts::SwapSolForBsh {
-                    payer: fixture.payer,
-                    state: fixture.state,
-                    mint: fixture.mint,
-                    sol_vault: fixture.sol_vault,
-                    payment_router: fixture.payment_router,
-                    vault_token_account: fixture.vault_token_account,
-                    payer_token_account: fixture.user_token_account,
-                    instructions: solana_instructions_sysvar::ID,
-                    token_program: spl_token::ID,
-                    system_program: system_program::ID,
-                }
-                .to_account_metas(None),
-            ),
-            data: crate::instruction::SwapSolForBsh {
-                deposited_lamports,
-                min_tokens_out: 1,
-            }
-            .data(),
-        };
+    fn sysvar_info_data(ixs: &[BorrowedInstruction], current_index: u16) -> Vec<u8> {
+        let mut data = construct_instructions_data(ixs);
+        store_current_index_checked(&mut data, current_index).unwrap();
+        data
+    }
 
-        harness.process(
-            &instruction,
-            &[Check::err(solana_sdk::program_error::ProgramError::Custom(
-                anchor_lang::error::ERROR_CODE_OFFSET + BshError::MissingSwapFundingTransfer as u32,
-            ))],
-        );
+    fn system_transfer_data(lamports: u64) -> Vec<u8> {
+        let mut d = vec![0u8; 12];
+        d[0..4].copy_from_slice(&2u32.to_le_bytes()); // System program `Transfer` discriminator
+        d[4..12].copy_from_slice(&lamports.to_le_bytes());
+        d
+    }
+
+    fn system_transfer_ix<'a>(
+        payer: &'a Pubkey,
+        router: &'a Pubkey,
+        data: &'a [u8],
+    ) -> BorrowedInstruction<'a> {
+        BorrowedInstruction {
+            program_id: &system_program::ID,
+            accounts: vec![
+                BorrowedAccountMeta { pubkey: payer, is_signer: true, is_writable: true },
+                BorrowedAccountMeta { pubkey: router, is_signer: false, is_writable: true },
+            ],
+            data,
+        }
+    }
+
+    fn program_ix<'a>(program_id: &'a Pubkey, account: &'a Pubkey) -> BorrowedInstruction<'a> {
+        BorrowedInstruction {
+            program_id,
+            accounts: vec![BorrowedAccountMeta {
+                pubkey: account,
+                is_signer: false,
+                is_writable: false,
+            }],
+            data: &[],
+        }
     }
 
     #[test]
-    fn mollusk_swap_bsh_for_sol_reaches_token_cpi_boundary() {
-        let harness = BshTestHarness::new();
-        let fixture = setup_swap_fixture(&harness, 80_000, 20_000, 5_000_000);
-        let amount = 20_000u64;
+    fn is_top_level_bsh_invocation_true_for_direct_bsh_instruction() {
+        let payer = Pubkey::new_unique();
+        let router = Pubkey::new_unique();
+        let acct = Pubkey::new_unique();
+        let xfer = system_transfer_data(1_000);
+        let ixs = vec![
+            system_transfer_ix(&payer, &router, &xfer),
+            program_ix(&crate::ID, &acct),
+        ];
+        let mut data = sysvar_info_data(&ixs, 1);
+        let mut lamports = 0u64;
+        let key = INSTRUCTIONS_SYSVAR_ID;
+        let owner = INSTRUCTIONS_SYSVAR_ID;
+        let info = AccountInfo::new(&key, false, false, &mut lamports, &mut data, &owner, false);
+        assert!(is_top_level_bsh_invocation(&info, 1).unwrap());
+    }
 
-        let instruction = Instruction {
-            program_id: to_address(crate::ID),
-            accounts: to_sdk_account_metas(
-                crate::accounts::SwapBshForSol {
-                    payer: fixture.payer,
-                    state: fixture.state,
-                    mint: fixture.mint,
-                    sol_vault: fixture.sol_vault,
-                    vault_token_account: fixture.vault_token_account,
-                    user_token_account: fixture.user_token_account,
-                    token_program: spl_token::ID,
-                    system_program: system_program::ID,
-                }
-                .to_account_metas(None),
-            ),
-            data: crate::instruction::SwapBshForSol {
-                amount,
-                min_lamports_out: 1,
-            }
-            .data(),
-        };
+    #[test]
+    fn is_top_level_bsh_invocation_false_for_foreign_top_level_instruction() {
+        let attacker = Pubkey::new_unique();
+        let payer = Pubkey::new_unique();
+        let router = Pubkey::new_unique();
+        let acct = Pubkey::new_unique();
+        let xfer = system_transfer_data(1_000);
+        let ixs = vec![
+            system_transfer_ix(&payer, &router, &xfer),
+            program_ix(&attacker, &acct),
+        ];
+        let mut data = sysvar_info_data(&ixs, 1);
+        let mut lamports = 0u64;
+        let key = INSTRUCTIONS_SYSVAR_ID;
+        let owner = INSTRUCTIONS_SYSVAR_ID;
+        let info = AccountInfo::new(&key, false, false, &mut lamports, &mut data, &owner, false);
+        assert!(!is_top_level_bsh_invocation(&info, 1).unwrap());
+    }
 
-        harness.process(
-            &instruction,
-            &[Check::instruction_err(
-                InstructionError::UnsupportedProgramId,
-            )],
-        );
+    #[test]
+    fn validate_swap_sol_prefund_accepts_top_level_call() {
+        let payer = Pubkey::new_unique();
+        let router = Pubkey::new_unique();
+        let acct = Pubkey::new_unique();
+        let lamports_in = 2_000_000u64;
+        let xfer = system_transfer_data(lamports_in);
+        let ixs = vec![
+            system_transfer_ix(&payer, &router, &xfer),
+            program_ix(&crate::ID, &acct),
+        ];
+        let mut data = sysvar_info_data(&ixs, 1);
+        let mut lamports = 0u64;
+        let key = INSTRUCTIONS_SYSVAR_ID;
+        let owner = INSTRUCTIONS_SYSVAR_ID;
+        let info = AccountInfo::new(&key, false, false, &mut lamports, &mut data, &owner, false);
+        validate_swap_sol_prefund(&info, &payer, &router, lamports_in)
+            .expect("direct top-level swap with a valid preceding transfer must pass");
+    }
+
+    #[test]
+    fn validate_swap_sol_prefund_rejects_cpi_stacked_call() {
+        let attacker = Pubkey::new_unique();
+        let payer = Pubkey::new_unique();
+        let router = Pubkey::new_unique();
+        let acct = Pubkey::new_unique();
+        let lamports_in = 2_000_000u64;
+        let xfer = system_transfer_data(lamports_in);
+        // current_index points at the attacker's top-level instruction; the
+        // funding transfer it would reuse is at index 0.
+        let ixs = vec![
+            system_transfer_ix(&payer, &router, &xfer),
+            program_ix(&attacker, &acct),
+        ];
+        let mut data = sysvar_info_data(&ixs, 1);
+        let mut lamports = 0u64;
+        let key = INSTRUCTIONS_SYSVAR_ID;
+        let owner = INSTRUCTIONS_SYSVAR_ID;
+        let info = AccountInfo::new(&key, false, false, &mut lamports, &mut data, &owner, false);
+        let err = validate_swap_sol_prefund(&info, &payer, &router, lamports_in)
+            .expect_err("CPI-stacked swap must be rejected");
+        assert_eq!(err, error!(BshError::SwapMustBeTopLevel));
+    }
+
+    #[test]
+    fn validate_locked_sale_prefund_rejects_cpi_stacked_call() {
+        let attacker = Pubkey::new_unique();
+        let payer = Pubkey::new_unique();
+        let router = Pubkey::new_unique();
+        let acct = Pubkey::new_unique();
+        let quoted = 100_000_000u64;
+        let xfer = system_transfer_data(quoted);
+        let ixs = vec![
+            system_transfer_ix(&payer, &router, &xfer),
+            program_ix(&attacker, &acct),
+        ];
+        let mut data = sysvar_info_data(&ixs, 1);
+        let mut lamports = 0u64;
+        let key = INSTRUCTIONS_SYSVAR_ID;
+        let owner = INSTRUCTIONS_SYSVAR_ID;
+        let info = AccountInfo::new(&key, false, false, &mut lamports, &mut data, &owner, false);
+        let err = validate_locked_sale_prefund(&info, &payer, &router, quoted)
+            .expect_err("CPI-stacked locked-sale buy must be rejected");
+        assert_eq!(err, error!(BshError::LockedSaleMustBeTopLevel));
     }
 }
