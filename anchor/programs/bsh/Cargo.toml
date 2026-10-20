@@ -17,6 +17,12 @@ no-idl = []
 no-log-ix-name = []
 idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build", "beton-shared-types/idl-build"]
 test-mode = []
+# Mollusk-based integration tests require a prebuilt SBF artifact and the
+# Solana test toolchain; they are opt-in so a plain `cargo test -p bsh --lib`
+# (pure-logic + introspection-guard tests) needs neither. Run with:
+#   anchor build --features test-mode
+#   cargo test -p bsh --features sbf-tests
+sbf-tests = ["dep:mollusk-svm", "dep:solana-sdk"]
 
 
 [dependencies]
@@ -27,4 +33,12 @@ solana-instructions-sysvar = "3.0.0"
 solana-sdk-ids = "2.2.1"
 solana-system-interface = "1.0.0"
 solana-security-txt = "1.1.2"
+# Opt-in (see the `sbf-tests` feature); never built for a normal `cargo test`.
+mollusk-svm = { version = "0.15.1", optional = true }
+solana-sdk = { version = "5.0.0", optional = true }
+
+[dev-dependencies]
+# Used by the Audit H-1 introspection-guard regression tests to build a
+# synthetic instructions sysvar; same version already in the dependency tree.
+solana-instruction = "3.4.0"
 
